@@ -1,0 +1,46 @@
+﻿# ===== 敏感信息（切勿上传）=====
+.env
+*.env
+!.env.example
+!**/.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 数据与图片（体积过大，勿传 GitHub）=====
+crawler/output/
+crawler/crawler.log
+crawler/_ppt_assets/
+graph-db/
+
+# 大体积 CSV 快照（若本地有）
+*.from_db.csv
+
+# 课程参考大文件（视频/PPT/压缩包）
+*.mp4
+*.rar
+
+# ===== Office 临时文件 =====
+~$*
+*.tmp
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===== 编译/打包 =====
+dist/
+build/
+*.zip

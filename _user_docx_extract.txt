@@ -1,0 +1,283 @@
+1. 前台用户表
+表含义
+存储前台用户的基本信息和管理相关数据，用于用户注册、登录、权限管理等功能。
+字段设计
+字段名
+类型
+允许空
+默认值
+字段含义
+user_id
+BIGINT
+NOT NULL
+AUTO_INCREMENT
+用户唯一标识ID
+username
+VARCHAR(50)
+NOT NULL
+-
+用户名
+Source
+VARCHAR
+Web/app
+nickname
+VARCHAR
+展示昵称
+avatar   url
+VARCHAR
+头像
+sex
+TINYINT
+r性别
+password
+VARCHAR(255)
+NOT NULL
+-
+密码（加密存储）
+email
+VARCHAR(100)
+YES
+NULL
+邮箱地址
+phone
+VARCHAR(20)
+YES
+NULL
+手机号码
+register_time
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP
+用户注册时间，用于后台按注册时间筛选用户
+last_login_at
+DATETIME
+YES
+NULL
+用户最近登录时间，用于后台查看用户最近活跃情况
+last_login_ip
+VARCHAR(64)
+YES
+NULL
+用户最近登录IP地址，用于后台安全管理和登录溯源
+status
+TINYINT
+NOT NULL
+1
+用户状态：1正常 0禁用
+disabled_reason
+VARCHAR(255)
+YES
+NULL
+用户账号被禁用的原因说明
+disabled_by
+BIGINT
+YES
+NULL
+禁用该账号的管理员ID
+disabled_at
+DATETIME
+YES
+NULL
+账号被禁用的时间
+created_at
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP
+记录创建时间
+updated_at
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+用户信息被后台修改的时间
+2. 评论表 (comment)
+表含义
+存储用户发布的评论内容，包含审核状态、来源信息等，用于内容管理和审核流程。
+字段设计
+字段名
+类型
+允许空
+默认值
+字段含义
+comment_id
+BIGINT
+NOT NULL
+AUTO_INCREMENT
+评论唯一标识ID
+user_id
+BIGINT
+NOT NULL
+-
+发表评论的用户ID
+artifact   id
+VARCHAR(64)
+NOT NULL
+文物ID
+content
+TEXT
+NOT NULL
+-
+评论内容
+source
+VARCHAR(20)
+NOT NULL
+-
+评论来源标识：web/app，用于后台按来源筛选审核
+audit_method
+TINYINT
+NOT NULL
+1
+审核方式：1自动审核 2人工审核 3自动+人工
+audit_status
+TINYINT
+NOT NULL
+0
+审核状态：0待审 1通过 2拒绝 3复审
+auto_audit_status
+TINYINT
+YES
+NULL
+自动审核结果状态
+sensitive_words_hit
+VARCHAR(255)
+YES
+NULL
+命中的敏感词列表，多个用逗号分隔
+auditor_id
+BIGINT
+YES
+NULL
+审核员ID，关联admin_user.admin_id
+status
+TINYINT
+NOT NULL
+1
+显示状态：1显示 0用户删除 2后台屏蔽
+deleted_by
+BIGINT
+YES
+NULL
+删除该评论的管理员ID
+delete_reason
+VARCHAR(255)
+YES
+NULL
+后台屏蔽或删除评论的原因
+created_at
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP
+评论创建时间
+updated_at
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+记录更新时间
+3. 用户上传文物照片表 (user_upload_photo)
+表含义
+存储用户上传的文物照片信息，包含审核状态、风险评估等数据，用于文物图片的内容安全审核。
+字段设计
+字段名
+类型
+允许空
+默认值
+字段含义
+photo_id
+BIGINT
+NOT NULL
+AUTO_INCREMENT
+照片唯一标识ID
+user_id
+BIGINT
+NOT NULL
+-
+上传照片的用户ID
+relic_id
+BIGINT / INT
+YES
+NULL
+关联 cultural_relics 表的 id，外键。
+photo_url
+VARCHAR(500)
+NOT NULL
+-
+照片存储路径或URL
+Description
+VARCHAR(500)
+YES
+NULL
+文字描述
+location
+VARCHAR(100)
+用户填写的地点，如"故宫博物院-珍宝馆"
+source
+VARCHAR(20)
+NOT NULL
+-
+上传来源标识：web/app
+status
+TINYINT
+NOT NULL
+0
+审核状态：0待审 1通过 2拒绝 3复审 4屏蔽
+audit_method
+TINYINT
+NOT NULL
+1
+审核方式：1自动审核 2人工审核 3自动+人工
+auto_audit_status
+TINYINT
+YES
+NULL
+图片自动审核结果状态
+auto_audit_score
+DECIMAL(5,2)
+YES
+NULL
+图片违规风险评分（0-100）
+auditor_id
+BIGINT
+YES
+NULL
+审核该照片的管理员ID
+reject_reason
+VARCHAR(255)
+YES
+NULL
+审核拒绝时填写的原因说明
+created_at
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP
+照片上传时间
+updated_at
+DATETIME
+NOT NULL
+CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+记录更新时间
+Save收藏表
+字段
+类型
+说明
+Save_id
+BIGINT PK AI
+主键
+user   id
+BIGINT NOT NULL
+artifact   id
+VARCHAR(64) NOT NULL
+created   at
+DATETIME NOT NULL
+点赞表 user   like
+文物点赞 user   like
+字段
+类型
+说明
+Like_id
+BIGINT PK AI
+主键
+user   id
+BIGINT NOT NULL
+artifact   id
+VARCHAR(64) NOT NULL
+created   at
+DATETIME NOT NULL

@@ -1,0 +1,18 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/>
+<title>服务器图片联调结果</title>
+<style>
+body{font-family:sans-serif;padding:16px;background:#f5f5f5}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.card{background:#fff;border-radius:8px;padding:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.card img{width:100%;height:200px;object-fit:contain;background:#fafafa}
+.missing{background:#fff2f0;color:#a8071a}
+.summary{background:#e6f4ff;padding:12px;border-radius:8px;margin-bottom:16px}
+</style></head><body>
+<h1>服务器图片联调测试</h1>
+<div class="summary">
+<p>MySQL (47.96.152.190:3306): 已连接</p>
+<p>API (http://47.96.152.190:8000): 已连通</p>
+<p>远程 API 出图: 0/6 | 本机磁盘出图: 6/6</p>
+</div>
+<div class="grid"><article class="card"><img src="http://47.96.152.190:8000/api/img/2/100098" alt="Bowl with Indented Lip, White Rim, and Five Russet Splashes"/><p><b>Bowl with Indented Lip, White Rim, and Five Russet Splashes</b><br/>path: images\harvard\100098_1.jpg</p></article><article class="card"><img src="http://47.96.152.190:8000/api/img/2/100099" alt="Tea Bowl with Indented Lip and Decoration of a Plum Blosson and Three Phoenixes in Flight"/><p><b>Tea Bowl with Indented Lip and Decoration of a Plum Blosson and Three Phoenixes in Flight</b><br/>path: images\harvard\100099_1.jpg</p></article><article class="card"><img src="http://47.96.152.190:8000/api/img/2/100180" alt="Circular Covered Box with Decoration of a Blossoming Chrysanthemum Plant"/><p><b>Circular Covered Box with Decoration of a Blossoming Chrysanthemum Plant</b><br/>path: images\harvard\100180_1.jpg</p></article><article class="card"><img src="http://47.96.152.190:8000/api/img/2/100181" alt="Bottle or Vase with Decoration of Blossoming Plum Branches"/><p><b>Bottle or Vase with Decoration of Blossoming Plum Branches</b><br/>path: images\harvard\100181_1.jpg</p></article><article class="card"><img src="http://47.96.152.190:8000/api/img/2/101448" alt="Small Votive Image Representing Laozi Seated at a Curved, Three-Legged Writing Desk, with Attached Flaming Halo and Stand"/><p><b>Small Votive Image Representing Laozi Seated at a Curved, Three-Legged Writing Desk, with Attached Flaming Halo and Stand</b><br/>path: images\harvard\101448_1.jpg</p></article><article class="card"><img src="http://47.96.152.190:8000/api/img/2/101449" alt="Funerary Model in the Form of a Single-Story, Tile-Roofed Building, Probably a Guard House, with a Locked Double Door and Two Windows with Grilles"/><p><b>Funerary Model in the Form of a Single-Story, Tile-Roofed Building, Probably a Guard House, with a Locked Double Door and Two Windows with Grilles</b><br/>path: images\harvard\101449_1.jpg</p></article></div>
+</body></html>

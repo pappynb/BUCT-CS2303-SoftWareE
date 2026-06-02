@@ -1,0 +1,272 @@
+ <!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>海外藏中国文物 — 图片画廊</title>
+  <style>
+    :root {
+      --bg: #f5f0eb;
+      --card: #fff;
+      --accent: #8b4513;
+      --text: #2c1810;
+      --muted: #7a6a62;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      position: sticky; top: 0; z-index: 10;
+      background: rgba(255,255,255,.92);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid #e8ddd4;
+      padding: 12px 20px;
+    }
+    header h1 { margin: 0 0 10px; font-size: 1.35rem; font-weight: 600; }
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    }
+    .toolbar input, .toolbar select, .toolbar button {
+      padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px;
+    }
+    .toolbar button {
+      background: var(--accent); color: #fff; border: none; cursor: pointer;
+    }
+    .toolbar button:hover { opacity: .9; }
+    .toolbar button.secondary { background: #fff; color: var(--text); border: 1px solid #ccc; }
+    #apiBase { min-width: 260px; }
+    .status {
+      margin: 12px 20px 0; padding: 10px 14px; border-radius: 8px;
+      background: #e8f4ea; font-size: 13px;
+    }
+    .status.err { background: #fdecea; color: #b42318; }
+    .masonry {
+      columns: 4 240px;
+      column-gap: 14px;
+      padding: 16px 20px 80px;
+    }
+    @media (max-width: 900px) { .masonry { columns: 2 160px; } }
+    .card {
+      break-inside: avoid;
+      margin-bottom: 14px;
+      background: var(--card);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 2px 8px rgba(44,24,16,.08);
+      cursor: pointer;
+      transition: transform .15s, box-shadow .15s;
+    }
+    .card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(44,24,16,.12); }
+    .card img {
+      width: 100%; display: block; background: #faf8f6;
+    }
+    .card .info { padding: 10px 12px 12px; }
+    .card .title {
+      font-size: 13px; font-weight: 600; line-height: 1.35;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .card .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .loader {
+      text-align: center; padding: 24px; color: var(--muted); font-size: 14px;
+    }
+    /* 灯箱 */
+    .lightbox {
+      display: none; position: fixed; inset: 0; z-index: 100;
+      background: rgba(0,0,0,.85);
+      flex-direction: column; align-items: center; justify-content: center;
+    }
+    .lightbox.open { display: flex; }
+    .lightbox img { max-width: 92vw; max-height: 70vh; object-fit: contain; border-radius: 4px; }
+    .lightbox .panel {
+      color: #fff; max-width: 720px; padding: 16px 20px; text-align: center;
+    }
+    .lightbox .panel h2 { margin: 0 0 8px; font-size: 1.1rem; font-weight: 500; }
+    .lightbox .panel p { margin: 4px 0; font-size: 13px; opacity: .85; }
+    .lightbox .thumbs { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+    .lightbox .thumbs img {
+      width: 56px; height: 56px; object-fit: cover; border-radius: 4px;
+      cursor: pointer; border: 2px solid transparent; opacity: .7;
+    }
+    .lightbox .thumbs img.active { border-color: #fff; opacity: 1; }
+    .lightbox .close {
+      position: absolute; top: 16px; right: 20px;
+      background: none; border: none; color: #fff; font-size: 28px; cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>海外藏中国文物 · 图片画廊</h1>
+    <div class="toolbar">
+      <input id="apiBase" value="http://47.96.152.190:8000" placeholder="API 地址"/>
+      <select id="museumId">
+        <option value="2">哈佛艺术博物馆</option>
+        <option value="1">史密森尼</option>
+        <option value="3">波士顿 MFA</option>
+      </select>
+      <input id="searchQ" placeholder="标题关键词" style="width:140px"/>
+      <input id="searchDynasty" placeholder="朝代" style="width:100px"/>
+      <button id="searchBtn">搜索</button>
+      <button id="resetBtn" class="secondary">重置</button>
+    </div>
+  </header>
+
+  <div id="status" class="status">滚动页面自动加载更多…</div>
+  <div id="gallery" class="masonry"></div>
+  <div id="loader" class="loader" style="display:none">加载中…</div>
+
+  <div id="lightbox" class="lightbox">
+    <button class="close" id="lbClose">&times;</button>
+    <img id="lbImg" src="" alt=""/>
+    <div class="panel">
+      <h2 id="lbTitle"></h2>
+      <p id="lbMeta"></p>
+      <div id="lbThumbs" class="thumbs"></div>
+    </div>
+  </div>
+
+  <script>
+    const API_DEFAULT = "http://47.96.152.190:8000";
+    let page = 1;
+    let total = 0;
+    let loading = false;
+    let finished = false;
+    const PAGE_SIZE = 24;
+
+    const $ = (id) => document.getElementById(id);
+
+    function apiBase() {
+      return ($("apiBase").value || API_DEFAULT).replace(/\/$/, "");
+    }
+
+    function buildUrl() {
+      const p = new URLSearchParams({
+        museum_id: $("museumId").value,
+        page: String(page),
+        size: String(PAGE_SIZE),
+      });
+      const q = $("searchQ").value.trim();
+      const d = $("searchDynasty").value.trim();
+      if (q) p.set("q", q);
+      if (d) p.set("dynasty", d);
+      return `${apiBase()}/api/artifacts?${p}`;
+    }
+
+    function esc(s) {
+      const d = document.createElement("div");
+      d.textContent = s || "";
+      return d.innerHTML;
+    }
+
+    function renderCard(item) {
+      if (!item.img_web) return "";
+      const src = apiBase() + item.img_web;
+      return `
+        <article class="card" data-json='${esc(JSON.stringify(item))}'>
+          <img src="${src}" alt="${esc(item.title)}" loading="lazy"
+               onerror="this.style.minHeight='120px'; this.style.background='#fdecea';"/>
+          <div class="info">
+            <div class="title">${esc(item.title || item.object_id)}</div>
+            <div class="meta">${esc(item.dynasty || "")}${item.material ? " · " + esc(item.material.slice(0, 30)) : ""}</div>
+          </div>
+        </article>`;
+    }
+
+    async function loadPage(reset = false) {
+      if (loading || (finished && !reset)) return;
+      if (reset) {
+        page = 1;
+        finished = false;
+        $("gallery").innerHTML = "";
+      }
+      loading = true;
+      $("loader").style.display = "block";
+      $("status").className = "status";
+      $("status").textContent = "加载中…";
+
+      try {
+        const res = await fetch(buildUrl());
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        total = data.total;
+        const withImg = data.list.filter((x) => x.has_local_image && x.img_web);
+        $("gallery").insertAdjacentHTML("beforeend", withImg.map(renderCard).join(""));
+
+        const loaded = page * PAGE_SIZE;
+        $("status").textContent =
+          `共 ${total} 件 · 已加载约 ${Math.min(loaded, total)} 件 · 本页 ${withImg.length} 张图`;
+
+        if (loaded >= total || data.list.length === 0) {
+          finished = true;
+          $("loader").textContent = "— 已全部加载 —";
+        } else {
+          page++;
+          $("loader").textContent = "继续滚动加载更多…";
+        }
+      } catch (e) {
+        $("status").className = "status err";
+        $("status").textContent = "加载失败: " + e.message;
+        $("loader").style.display = "none";
+        loading = false;
+        return;
+      }
+      loading = false;
+      $("loader").style.display = finished ? "block" : "none";
+    }
+
+    function openLightbox(item) {
+      const base = apiBase();
+      const urls = (item.imgs_web || []).map((p) => base + p);
+      if (!urls.length && item.img_web) urls.push(base + item.img_web);
+
+      $("lbTitle").textContent = item.title || item.object_id;
+      $("lbMeta").textContent =
+        [item.dynasty, item.material, item.artist, "ID: " + item.object_id].filter(Boolean).join(" · ");
+      $("lbImg").src = urls[0] || "";
+      $("lbThumbs").innerHTML = urls.map((u, i) =>
+        `<img src="${u}" class="${i === 0 ? "active" : ""}" data-src="${u}"/>`
+      ).join("");
+      $("lightbox").classList.add("open");
+    }
+
+    $("gallery").addEventListener("click", (e) => {
+      const card = e.target.closest(".card");
+      if (!card) return;
+      try {
+        openLightbox(JSON.parse(card.dataset.json));
+      } catch (_) {}
+    });
+
+    $("lbThumbs").addEventListener("click", (e) => {
+      const t = e.target.closest("img");
+      if (!t) return;
+      $("lbImg").src = t.dataset.src;
+      $("lbThumbs").querySelectorAll("img").forEach((x) => x.classList.remove("active"));
+      t.classList.add("active");
+    });
+
+    $("lbClose").onclick = () => $("lightbox").classList.remove("open");
+    $("lightbox").onclick = (e) => { if (e.target.id === "lightbox") $("lightbox").classList.remove("open"); };
+
+    window.addEventListener("scroll", () => {
+      if (finished || loading) return;
+      const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 400;
+      if (nearBottom) loadPage();
+    });
+
+    $("searchBtn").onclick = () => loadPage(true);
+    $("resetBtn").onclick = () => {
+      $("searchQ").value = "";
+      $("searchDynasty").value = "";
+      loadPage(true);
+    };
+    $("museumId").onchange = () => loadPage(true);
+
+    loadPage(true);
+  </script>
+</body>
+</html>
