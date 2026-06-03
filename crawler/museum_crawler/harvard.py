@@ -17,7 +17,7 @@ from __future__ import annotations
 import csv
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -32,6 +32,12 @@ from museum_crawler.http_client import (
 )
 from museum_crawler.bibliography import format_harvard_publications
 from museum_crawler.config import MUSEUM_ID_HARVARD
+from museum_crawler.incremental import (
+    IncrementalCsvStore,
+    append_change_log,
+    diff_fields,
+    save_state,
+)
 from museum_crawler.io_csv import append_csv, write_csv
 from museum_crawler.record_build import finalize_record
 from museum_crawler.text_geography import (
@@ -52,6 +58,7 @@ HAM_FIELDS = ",".join([
     "medium", "description", "dimensions", "creditline",
     "objectnumber", "url", "primaryimageurl", "images",
     "people", "places", "culture", "provenance", "publicationcount",
+    "lastupdate",
 ])
 
 
@@ -62,6 +69,20 @@ _HAM_IIIF_SIZES = (
 )
 _HAM_IMAGE_SEP = " | "
 _HAM_MAX_SLOTS = 24
+
+
+def _ham_source_updated_at(rec: dict[str, Any]) -> str:
+    """Harvard API 的源侧更新时间字段，用作增量水位。"""
+    return str(rec.get("lastupdate") or "").strip()
+
+
+def _ham_max_source_updated_at(rows: list[dict[str, str]]) -> str:
+    vals = [
+        str(r.get("source_updated_at") or "").strip()
+        for r in rows
+        if str(r.get("source_updated_at") or "").strip()
+    ]
+    return max(vals) if vals else ""
 
 
 def _ham_iiif_variants(base: str) -> list[str]:
@@ -403,6 +424,7 @@ def _ham_parse(rec: dict[str, Any]) -> dict[str, str]:
         "credit_line": credit,
         "accession_number": acc,
         "iiif_manifest_url": iiif_manifest,
+        "source_updated_at": _ham_source_updated_at(rec),
     }
     return finalize_record(partial, MUSEUM_ID_HARVARD)
 
@@ -418,6 +440,20 @@ def _ham_clear_local_images(img_root: Path, oid: str) -> None:
             p.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _ham_preview_record(rec: dict[str, Any]) -> dict[str, str]:
+    """用于增量比对的预览行，不包含本地图片路径。"""
+    preview = _ham_parse(rec)
+    slots = _ham_image_slots(rec)
+    cands = _ham_image_candidates(rec)
+    preview["crawl_date"] = date.today().isoformat()
+    preview["image_url"] = cands[0] if cands else ""
+    preview["image_urls"] = _HAM_IMAGE_SEP.join(cands[: len(slots)]) if slots else ""
+    preview["image_path"] = ""
+    preview["image_paths"] = ""
+    preview["image_count"] = str(len(slots))
+    return preview
 
 
 def repair_harvard_multi_images(
@@ -534,14 +570,30 @@ def crawl_harvard(
     *,
     allow_no_image: bool = False,
     strict_multi: bool = True,
-) -> tuple[int, int]:
+    incremental: bool = True,
+    source_incremental: bool = True,
+    incremental_since: str | None = None,
+) -> dict[str, Any]:
     sess = make_session()
     sess.headers.setdefault("Referer", "https://www.harvardartmuseums.org/")
     crawl_day = date.today().isoformat()
     img_ok = 0
     page = 1
-    rows_batch: list[dict[str, Any]] = []
     total_written = 0
+    total_scanned = 0
+    total_new = 0
+    total_updated = 0
+    total_unchanged = 0
+    total_failed = 0
+    total_skipped = 0
+    change_rows: list[dict[str, Any]] = []
+    rows_batch: list[dict[str, Any]] = []
+
+    store = IncrementalCsvStore.load(out_csv) if incremental else None
+    source_watermark = (incremental_since or "").strip()
+    if source_incremental and not source_watermark and store:
+        source_watermark = _ham_max_source_updated_at(store.rows)
+    stop_source_incremental = False
 
     log.info(
         "[HAM] 开始：culture=Chinese|China, hasimage=1 | 严格多图=%s",
@@ -549,21 +601,16 @@ def crawl_harvard(
     )
     pbar = tqdm(desc="Harvard", unit="条",
                 total=limit if limit else None, dynamic_ncols=True)
-
-    seen_ids = _ham_load_seen_ids(out_csv)
-    if seen_ids:
-        log.info("[HAM] 断点：多图已齐全 ID %d 个", len(seen_ids))
-
-    def flush_h() -> None:
-        nonlocal total_written, rows_batch
-        if rows_batch:
-            append_csv(out_csv, rows_batch, db_writer)
-            total_written += len(rows_batch)
-            rows_batch = []
+    if store and store.rows:
+        log.info("[HAM] 本地快照：%d 条", len(store.rows))
+    if source_incremental and source_watermark:
+        log.info("[HAM] 源侧增量水位：lastupdate > %s", source_watermark)
 
     try:
         while True:
-            already = total_written + len(rows_batch)
+            if stop_source_incremental:
+                break
+            already = total_scanned
             if limit and already >= limit:
                 break
             size = min(page_size, limit - already) if limit else page_size
@@ -575,6 +622,9 @@ def crawl_harvard(
                 "page": page,
                 "fields": HAM_FIELDS,
             }
+            if source_incremental and source_watermark:
+                params["sort"] = "lastupdate"
+                params["sortorder"] = "desc"
             log.info("[HAM] page=%d size=%d", page, size)
             try:
                 r = retry_get(sess, HAM_API, params=params, timeout=90)
@@ -592,28 +642,56 @@ def crawl_harvard(
             n_dup = n_noimg = n_dl_fail = n_partial = 0
             n_ok_page = 0
             for rec in records:
-                already = total_written + len(rows_batch)
+                total_scanned += 1
+                already = total_scanned
                 if limit and already >= limit:
                     break
                 oid = str(rec.get("id") or "")
-                if not oid or oid in seen_ids:
+                if not oid:
                     n_dup += 1
                     continue
+                source_updated_at = _ham_source_updated_at(rec)
+                if (
+                    source_incremental
+                    and source_watermark
+                    and source_updated_at
+                    and source_updated_at <= source_watermark
+                ):
+                    stop_source_incremental = True
+                    log.info(
+                        "[HAM] 到达源侧增量水位：object=%s lastupdate=%s <= %s",
+                        oid,
+                        source_updated_at,
+                        source_watermark,
+                    )
+                    break
+                preview = _ham_preview_record(rec)
+                old = store.get(oid) if store else None
+                if store and old:
+                    changed = diff_fields(old, preview)
+                    if not changed:
+                        total_unchanged += 1
+                        n_dup += 1
+                        continue
+                else:
+                    changed = list(preview.keys())
+
                 slots = _ham_image_slots(rec)
                 if not slots:
                     n_noimg += 1
+                    total_skipped += 1
                     continue
                 jitter(delay, 0.2, 0.8)
+                if old:
+                    _ham_clear_local_images(img_root, oid)
                 urls, paths, ok_n, expect_n = _ham_download_all_slot_images(
                     sess, rec, img_root, oid, delay
                 )
                 if ok_n == 0:
                     n_dl_fail += 1
+                    total_failed += 1
                     if allow_no_image:
-                        parsed = _ham_parse(rec)
-                        parsed["crawl_date"] = crawl_day
-                        cands = _ham_image_candidates(rec)
-                        parsed["image_url"] = cands[0] if cands else ""
+                        parsed = preview
                         _ham_apply_multi_images(parsed, [], [])
                     else:
                         log.info(
@@ -623,14 +701,14 @@ def crawl_harvard(
                         continue
                 elif strict_multi and ok_n < expect_n:
                     n_partial += 1
+                    total_failed += 1
                     log.info(
                         "[HAM] 跳过 object %s：严格多图未齐（%d/%d 张）",
                         oid, ok_n, expect_n,
                     )
                     continue
                 else:
-                    parsed = _ham_parse(rec)
-                    parsed["crawl_date"] = crawl_day
+                    parsed = preview
                     _ham_apply_multi_images(parsed, urls, paths)
                     img_ok += ok_n
 
@@ -643,32 +721,101 @@ def crawl_harvard(
                     parsed["bibliography"] = _ham_fetch_publications(sess, oid, api_key)
 
                 n_ok_page += 1
-                seen_ids.add(oid)
-                rows_batch.append(parsed)
+                change_type = "updated" if old else "new"
+                if store:
+                    change_type, changed_fields = store.upsert(parsed)
+                    if change_type == "unchanged":
+                        total_unchanged += 1
+                        continue
+                    if change_type == "new":
+                        total_new += 1
+                    elif change_type == "updated":
+                        total_updated += 1
+                    change_rows.append(
+                        {
+                            "object_id": oid,
+                            "change_type": change_type,
+                            "changed_fields": changed_fields,
+                            "title": parsed.get("title", ""),
+                            "detail_url": parsed.get("detail_url", ""),
+                        }
+                    )
+                    rows_batch.append(parsed)
+                    if len(rows_batch) >= 10:
+                        if db_writer:
+                            db_writer.upsert_batch(rows_batch)
+                        rows_batch = []
+                else:
+                    rows_batch.append(parsed)
+                    if len(rows_batch) >= 10:
+                        append_csv(out_csv, rows_batch, db_writer)
+                        total_written += len(rows_batch)
+                        rows_batch = []
                 pbar.update(1)
                 pbar.set_postfix_str(
-                    f"写入{total_written + len(rows_batch)} 图{img_ok}",
+                    f"写入{total_new + total_updated + len(rows_batch)} 图{img_ok}",
                     refresh=True,
                 )
-                if len(rows_batch) >= 10:
-                    flush_h()
 
             log.info(
                 "[HAM] 本页小结 page=%d | API 返回 %d 条 | 本页成功 %d 条 | "
-                "跳过重复 %d | 无图位 %d | 全失败 %d | 多图未齐 %d | 累计已写入 %d",
+                "重复/未变 %d | 无图位 %d | 全失败 %d | 多图未齐 %d | 累计已写入 %d",
                 page, len(records), n_ok_page, n_dup, n_noimg, n_dl_fail, n_partial,
-                total_written + len(rows_batch),
+                total_written,
             )
-            flush_h()
             page += 1
             info = data.get("info") or {}
             if not info.get("next") or len(records) < size:
                 break
             jitter(delay, 0.5, 1.5)
     finally:
-        flush_h()
         pbar.close()
-        log.info("[HAM] 完成：写入 %d 条，图片 %d 张 → %s",
-                 total_written, img_ok, out_csv)
+        if store:
+            if rows_batch and db_writer:
+                db_writer.upsert_batch(rows_batch)
+            store.save()
+            total_written = total_new + total_updated
+            summary = {
+                "records": total_written,
+                "images_downloaded": img_ok,
+                "new": total_new,
+                "updated": total_updated,
+                "unchanged": total_unchanged,
+                "failed": total_failed,
+                "skipped": total_skipped,
+                "scanned": total_scanned,
+                "changes": len(change_rows),
+                "source_incremental_since": source_watermark,
+            }
+            append_change_log(
+                out_csv.parent / "crawl_changes.jsonl",
+                run_at=datetime.now().isoformat(timespec="seconds"),
+                museum="Harvard",
+                csv_name=out_csv.name,
+                changes=change_rows,
+                summary=summary,
+            )
+            save_state(
+                out_csv.parent / ".crawl_state",
+                "harvard",
+                store,
+                summary=summary,
+            )
+        elif rows_batch:
+            append_csv(out_csv, rows_batch, db_writer)
+            total_written += len(rows_batch)
+        log.info("[HAM] 完成：写入 %d 条（新 %d / 更 %d / 未变 %d），图片 %d 张 → %s",
+                 total_written, total_new, total_updated, total_unchanged, img_ok, out_csv)
 
-    return total_written, img_ok
+    return {
+        "records": total_written,
+        "images_downloaded": img_ok,
+        "new": total_new,
+        "updated": total_updated,
+        "unchanged": total_unchanged,
+        "failed": total_failed,
+        "skipped": total_skipped,
+        "scanned": total_scanned,
+        "changes": len(change_rows),
+        "source_incremental_since": source_watermark,
+    }

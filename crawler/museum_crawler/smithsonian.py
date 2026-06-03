@@ -17,7 +17,7 @@ import csv
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
@@ -34,6 +34,12 @@ from museum_crawler.http_client import (
 )
 from museum_crawler.io_csv import append_csv
 from museum_crawler.config import MUSEUM_ID_SMITHSONIAN
+from museum_crawler.incremental import (
+    IncrementalCsvStore,
+    append_change_log,
+    diff_fields,
+    save_state,
+)
 from museum_crawler.record_build import finalize_record
 from museum_crawler.text_geography import (
     extract_province,
@@ -365,7 +371,6 @@ def _iter_s3_unit(sess: Any, unit: str) -> Iterator[dict[str, Any]]:
 def _si_try_write_one(
     *,
     row: dict[str, Any],
-    seen_ids: set[str],
     sess: Any,
     img_sess: Any,
     api_key: str,
@@ -376,41 +381,52 @@ def _si_try_write_one(
     limit: int,
     total_written: int,
     rows_batch: list[dict[str, Any]],
+    store: IncrementalCsvStore | None = None,
     fetch_content: bool = True,
-) -> tuple[Optional[dict[str, Any]], str]:
+) -> tuple[Optional[dict[str, Any]], str, list[str]]:
     """
-  处理单条：返回 (record, status)。
-  status: ok | dup | noimg | dlfail | limit
+    处理单条：返回 (record, status, changed_fields)。
+    status: ok | dup | noimg | dlfail | limit | unchanged
     """
     already = total_written + len(rows_batch)
     if limit and already >= limit:
-        return None, "limit"
+        return None, "limit", []
 
     oid = str(row.get("id") or "").strip()
-    if not oid or oid in seen_ids:
-        return None, "dup"
+    if not oid:
+        return None, "dup", []
 
+    preview_row = _si_parse(row)
+    preview_row["crawl_date"] = crawl_day
     img_url = _si_best_image(row)
     if not img_url and fetch_content:
         row = _si_fetch_full_row(sess, api_key, row, api_delay)
         img_url = _si_best_image(row)
+        preview_row = _si_parse(row)
+        preview_row["crawl_date"] = crawl_day
 
     if not img_url:
-        return None, "noimg"
+        return None, "noimg", []
 
     sid = safe_filename_fragment(oid)
     ext = ext_from_url(img_url)
+    preview_row["image_url"] = img_url
+    preview_row["image_path"] = str(Path("images") / "smithsonian" / f"{sid}.{ext}")
+    old = store.get(oid) if store else None
+    if old:
+        changed = diff_fields(old, preview_row)
+        if not changed:
+            return None, "unchanged", []
+
     dest = img_root / "smithsonian" / f"{sid}.{ext}"
     jitter(img_delay, 0.5, 2.0)
     if not download_image(img_sess, img_url, dest):
-        return None, "dlfail"
+        return None, "dlfail", []
 
-    rec = _si_parse(row)
-    rec["crawl_date"] = crawl_day
+    rec = preview_row
     rec["image_url"] = img_url
     rec["image_path"] = str(Path("images") / "smithsonian" / f"{sid}.{ext}")
-    seen_ids.add(oid)
-    return rec, "ok"
+    return rec, "ok", diff_fields(old or {}, rec) if old else list(rec.keys())
 
 
 def crawl_smithsonian(
@@ -426,12 +442,19 @@ def crawl_smithsonian(
     s3_only: bool = False,
     s3_units: Optional[tuple[str, ...]] = None,
     api_max_pages: int = 40,
-) -> tuple[int, int]:
+) -> dict[str, int]:
     sess = make_session()
     img_sess = make_session()
     rows_batch: list[dict[str, Any]] = []
     total_written = 0
-    seen_ids: set[str] = set()
+    total_scanned = 0
+    total_new = 0
+    total_updated = 0
+    total_unchanged = 0
+    total_failed = 0
+    total_skipped = 0
+    change_rows: list[dict[str, Any]] = []
+    store = IncrementalCsvStore.load(out_csv)
     crawl_day = date.today().isoformat()
     img_ok = 0
 
@@ -440,7 +463,7 @@ def crawl_smithsonian(
         units = SI_ART_UNITS
 
     log.info(
-        "[SI] 开始：先 S3 馆别 %s（真·可下图）；%s",
+        "[SI] 开始：先 S3 馆别 %s（可下图）；%s",
         ",".join(units),
         "跳过 API" if s3_only else f"API 每档最多 {api_max_pages} 页",
     )
@@ -451,14 +474,8 @@ def crawl_smithsonian(
         dynamic_ncols=True,
     )
 
-    if out_csv.exists() and out_csv.stat().st_size > 0:
-        try:
-            with open(out_csv, encoding="utf-8-sig") as fh:
-                for row in csv.DictReader(fh):
-                    seen_ids.add(row.get("object_id", "").strip())
-            log.info("[SI] 读取断点 ID %d 个", len(seen_ids))
-        except Exception:
-            pass
+    if store.rows:
+        log.info("[SI] 本地快照：%d 条", len(store.rows))
 
     def _si_pbar_postfix(*, page_i: int = 0, page_n: int = 0, phase: str = "") -> None:
         written = total_written + len(rows_batch)
@@ -470,8 +487,12 @@ def crawl_smithsonian(
     def flush() -> None:
         nonlocal total_written, rows_batch
         if rows_batch:
-            append_csv(out_csv, rows_batch, db_writer)
-            total_written += len(rows_batch)
+            if store:
+                if db_writer:
+                    db_writer.upsert_batch(rows_batch)
+            else:
+                append_csv(out_csv, rows_batch, db_writer)
+                total_written += len(rows_batch)
             rows_batch = []
 
     try:
@@ -486,9 +507,8 @@ def crawl_smithsonian(
                     break
                 if not _si_china_related(row):
                     continue
-                rec, st = _si_try_write_one(
+                rec, st, _ = _si_try_write_one(
                     row=row,
-                    seen_ids=seen_ids,
                     sess=sess,
                     img_sess=img_sess,
                     api_key=api_key,
@@ -499,9 +519,28 @@ def crawl_smithsonian(
                     limit=limit,
                     total_written=total_written,
                     rows_batch=rows_batch,
+                    store=store,
                     fetch_content=False,
                 )
+                total_scanned += 1
                 if st == "ok" and rec:
+                    change_type, changed_fields = store.upsert(rec)
+                    if change_type == "new":
+                        total_new += 1
+                    elif change_type == "updated":
+                        total_updated += 1
+                    elif change_type == "unchanged":
+                        total_unchanged += 1
+                        continue
+                    change_rows.append(
+                        {
+                            "object_id": rec.get("object_id", ""),
+                            "change_type": change_type,
+                            "changed_fields": changed_fields,
+                            "title": rec.get("title", ""),
+                            "detail_url": rec.get("detail_url", ""),
+                        }
+                    )
                     rows_batch.append(rec)
                     img_ok += 1
                     n_ok += 1
@@ -511,6 +550,8 @@ def crawl_smithsonian(
                         flush()
                 elif st in ("noimg", "dlfail", "dup"):
                     n_skip += 1
+                elif st == "unchanged":
+                    total_unchanged += 1
             log.info("[SI] S3 %s 完成：写入 %d，跳过 %d", unit.upper(), n_ok, n_skip)
             flush()
             jitter(api_delay, 0.5, 1.0)
@@ -555,9 +596,8 @@ def crawl_smithsonian(
                     n_dup = n_noimg = n_dl_fail = n_ok_page = 0
                     page_n = len(batch)
                     for page_i, row in enumerate(batch, 1):
-                        rec, st = _si_try_write_one(
+                        rec, st, _ = _si_try_write_one(
                             row=row,
-                            seen_ids=seen_ids,
                             sess=sess,
                             img_sess=img_sess,
                             api_key=api_key,
@@ -568,17 +608,38 @@ def crawl_smithsonian(
                             limit=limit,
                             total_written=total_written,
                             rows_batch=rows_batch,
+                            store=store,
                             fetch_content=True,
                         )
                         if st == "limit":
                             break
+                        total_scanned += 1
                         if st == "dup":
                             n_dup += 1
                         elif st == "noimg":
                             n_noimg += 1
                         elif st == "dlfail":
                             n_dl_fail += 1
+                        elif st == "unchanged":
+                            total_unchanged += 1
                         elif st == "ok" and rec:
+                            change_type, changed_fields = store.upsert(rec)
+                            if change_type == "new":
+                                total_new += 1
+                            elif change_type == "updated":
+                                total_updated += 1
+                            elif change_type == "unchanged":
+                                total_unchanged += 1
+                                continue
+                            change_rows.append(
+                                {
+                                    "object_id": rec.get("object_id", ""),
+                                    "change_type": change_type,
+                                    "changed_fields": changed_fields,
+                                    "title": rec.get("title", ""),
+                                    "detail_url": rec.get("detail_url", ""),
+                                }
+                            )
                             rows_batch.append(rec)
                             img_ok += 1
                             n_ok_page += 1
@@ -600,14 +661,56 @@ def crawl_smithsonian(
     finally:
         flush()
         pbar.close()
-        log.info("[SI] 完成：写入 %d 条，图片 %d 张 → %s", total_written, img_ok, out_csv)
+        if store and rows_batch and db_writer:
+            db_writer.upsert_batch(rows_batch)
+        store.save()
+        total_written = total_new + total_updated
+        summary = {
+            "records": total_written,
+            "images_downloaded": img_ok,
+            "new": total_new,
+            "updated": total_updated,
+            "unchanged": total_unchanged,
+            "failed": total_failed,
+            "skipped": total_skipped,
+            "scanned": total_scanned,
+            "changes": len(change_rows),
+        }
+        append_change_log(
+            out_csv.parent / "crawl_changes.jsonl",
+            run_at=datetime.now().isoformat(timespec="seconds"),
+            museum="Smithsonian",
+            csv_name=out_csv.name,
+            changes=change_rows,
+            summary=summary,
+        )
+        save_state(
+            out_csv.parent / ".crawl_state",
+            "smithsonian",
+            store,
+            summary=summary,
+        )
+        log.info(
+            "[SI] 完成：写入 %d 条（新 %d / 更 %d / 未变 %d），图片 %d 张 → %s",
+            total_written, total_new, total_updated, total_unchanged, img_ok, out_csv,
+        )
         if total_written == 0:
             log.warning(
                 "[SI] 0 条。官网 Kite/NMAH 卡片多数无 ids 开放链；请用 "
                 "--si-s3-only --si-units fsg,chndm --limit 20 试跑。确认 SI_DATA_GOV_API_KEY。"
             )
 
-    return total_written, img_ok
+    return {
+        "records": total_written,
+        "images_downloaded": img_ok,
+        "new": total_new,
+        "updated": total_updated,
+        "unchanged": total_unchanged,
+        "failed": total_failed,
+        "skipped": total_skipped,
+        "scanned": total_scanned,
+        "changes": len(change_rows),
+    }
 
 
 def _si_local_path(img_root: Path, oid: str, idx: int, ext: str) -> Path:

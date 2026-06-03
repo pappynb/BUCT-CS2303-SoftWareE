@@ -10,7 +10,7 @@
   pip install -r requirements.txt
   uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-接口文档：http://localhost:8000/docs
+接口文档：http://47.96.152.190:8000/docs
 """
 from __future__ import annotations
 
@@ -74,6 +74,7 @@ def _resolve_paths_from_row(row: dict[str, Any]) -> list[Path]:
 
 
 def _row_to_api(row: dict[str, Any], *, include_detail: bool = False) -> dict[str, Any]:
+    # 前端要的json
     museum_id = row.get("museum_id")
     object_id = row.get("object_id")
     local_files = _resolve_paths_from_row(row)
@@ -111,7 +112,7 @@ def health():
         "image_roots": [str(p) for p in IMAGE_ROOTS],
     }
 
-
+# 所有的文物
 @app.get("/api/artifacts")
 def list_artifacts(
     museum_id: Optional[int] = Query(None, description="馆别 1=史密森尼 2=哈佛 3=MFA"),
@@ -130,6 +131,7 @@ def list_artifacts(
         where.append("museum_id = %s")
         params.append(museum_id)
     if dynasty:
+    # 模糊查询
         where.append("dynasty LIKE %s")
         params.append(f"%{dynasty}%")
     if material:
@@ -166,7 +168,7 @@ def list_artifacts(
         "list": [_row_to_api(r) for r in rows],
     }
 
-
+# 特定的文物
 @app.get("/api/artifacts/{museum_id}/{object_id}")
 def get_artifact(museum_id: int, object_id: str):
     conn = _db_conn()

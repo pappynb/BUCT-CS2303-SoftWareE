@@ -68,6 +68,7 @@ CSV_FIELDS: list[str] = [
     "image_count",  # 成功落盘的图片张数
     "credit_line",
     "accession_number",
+    "source_updated_at",  # 馆方源数据更新时间；无可靠字段时为空
     "crawl_date",
 ]
 

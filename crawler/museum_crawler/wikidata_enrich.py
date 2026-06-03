@@ -8,9 +8,12 @@
 - 仅当下列字段为空时，用 Wikidata/维基补全：``artist_wikidata_id``、
   ``artist_birth``、``artist_death``、``artist_bio``、``artist_wikipedia_summary``。
 - ``--force`` 只强制重拉上述补全列，仍不改动爬虫作者/籍贯。
+- ``--csv`` 只会处理你显式传入的文件；不传时，默认按 ``output/`` 下三馆 CSV 依次处理。
 - 对 ``artist`` 去重后，每个唯一作者名最多请求一次 Wikidata；检索名跳过藏家/交易商
   （如 ``Freer, Charles Lang``），优先画家段（如 ``San, Lee Chiao; Freer, …`` → ``San, Lee Chiao``）。
 - 若某作者各补全列均已非空且未 ``--force``，则跳过该作者的 API 请求。
+- 因此，日志里显示的是“唯一作者数”，不是 CSV 行数；如果一个文件里只有一个可检索作者，
+  运行结果就只会看到一个作者条目。
 
 请遵守 https://wikimediafoundation.org/wiki/Policy:User-Agent 使用独立 UA。
 """
@@ -627,7 +630,7 @@ def main() -> None:
         "--csv",
         type=Path,
         nargs="*",
-        help="要处理的 CSV（默认：output 下三馆合并文件）",
+        help="要处理的 CSV；不传则默认处理 output 下三馆 CSV。注意：这里是输入文件列表，不是按馆别自动展开。",
     )
     ap.add_argument(
         "--output-dir",

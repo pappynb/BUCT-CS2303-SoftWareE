@@ -9,35 +9,49 @@ import argparse
 import json
 import logging
 import os
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
+# 直接执行 ``python museum_crawler/cli.py`` 时，需要先把项目根目录加入 path，
+# 否则后续 ``import museum_crawler.*`` 会失败。
+if __package__ in (None, ""):
+    _project_root = Path(__file__).resolve().parent.parent
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+
 from museum_crawler.config import BASE_DIR, LOG_PATH, setup_logging
 from museum_crawler.db import MySQLWriter, mysql_configured
+from museum_crawler.incremental import append_change_log, append_run_log, save_state
 from museum_crawler.harvard import crawl_harvard, repair_harvard_multi_images
 from museum_crawler.kg_export import export_knowledge_graph
 from museum_crawler.mfa_boston import crawl_mfa, repair_mfa_images, repair_mfa_metadata
 from museum_crawler.quality import quality_check
 from museum_crawler.smithsonian import crawl_smithsonian
+from museum_crawler.neo4j_sync import neo4j_configured, sync_kg_to_neo4j
 
 log = logging.getLogger("spider")
 
 
-def _print_summary(stats: dict[str, tuple[int, int]]) -> None:
+def _print_summary(stats: dict[str, dict[str, int]]) -> None:
     print("\n" + "=" * 50)
-    print("  爬取汇总（课程设计数量参考：≥5000 条）")
+    print("  爬取汇总（增量模式）")
     print("=" * 50)
-    total_r = total_i = 0
-    for name, (nr, ni) in stats.items():
-        print(f"  {name:30s} {nr:6d} 条  {ni:6d} 张图")
+    total_r = total_i = total_new = total_upd = total_unch = 0
+    for name, st in stats.items():
+        nr = int(st.get("records", 0))
+        ni = int(st.get("images_downloaded", 0))
+        nw = int(st.get("new", 0))
+        up = int(st.get("updated", 0))
+        un = int(st.get("unchanged", 0))
+        print(f"  {name:30s} {nr:6d} 条  {ni:6d} 张图  新{nw:5d} 更{up:5d} 未变{un:5d}")
         total_r += nr
         total_i += ni
+        total_new += nw
+        total_upd += up
+        total_unch += un
     print("-" * 50)
-    print(f"  {'合计':30s} {total_r:6d} 条  {total_i:6d} 张图")
-    target = 5000
-    if total_r < target:
-        shortage = target - total_r
-        print(f"\n  [!] 距 {target} 条还差 {shortage} 条，可去掉 --limit 全量爬取。")
+    print(f"  {'合计':30s} {total_r:6d} 条  {total_i:6d} 张图  新{total_new:5d} 更{total_upd:5d} 未变{total_unch:5d}")
     print("=" * 50 + "\n")
 
 
@@ -45,7 +59,7 @@ def _append_run_ledger(
     out_dir: Path,
     *,
     args: argparse.Namespace,
-    stats: dict[str, tuple[int, int]],
+    stats: dict[str, dict[str, int]],
     kg_stats: dict[str, int] | None,
 ) -> None:
     """
@@ -66,18 +80,21 @@ def _append_run_ledger(
             "page_size": args.page_size,
             "si_rows": args.si_rows,
             "ham_allow_no_image": args.ham_allow_no_image,
+            "ham_source_incremental": not args.no_ham_source_incremental,
+            "ham_incremental_since": args.ham_incremental_since,
             "mysql_enabled": not args.no_mysql,
             "kg_export": not args.no_kg_export,
         },
-        "museums": {
-            k: {"records": v[0], "images_downloaded": v[1]}
-            for k, v in stats.items()
-        },
+        "museums": stats,
         "kg": kg_stats or {},
     }
-    ledger = out_dir / "crawl_runs.jsonl"
-    with open(ledger, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    append_run_log(
+        out_dir / "crawl_runs.jsonl",
+        run_at=payload["run_at"],
+        params=payload["params"],
+        museums=payload["museums"],
+        kg=payload["kg"],
+    )
 
 
 def main() -> None:
@@ -94,6 +111,10 @@ def main() -> None:
   # 作者 Wikidata / 维基增量（默认处理 output 下三馆 CSV）：
   python enrich_wikidata.py --csv output/harvard_art_museums.csv
   python museum_spider.py enrich-wikidata --delay 1.5
+
+说明：
+  - 传 ``--csv`` 时只处理你列出的文件；不传则默认处理 output 下三馆 CSV。
+  - 脚本内部还会按 ``artist`` 去重，所以日志里显示的是“唯一作者数”，不是 CSV 行数。
         """,
     )
     ap.add_argument(
@@ -144,6 +165,19 @@ def main() -> None:
         "--ham-relaxed-multi",
         action="store_true",
         help="哈佛：允许多图藏品只下到部分图也入库（默认严格：API 有几个图位就要下齐）",
+    )
+    ap.add_argument(
+        "--ham-incremental-since",
+        default=os.environ.get("HAM_INCREMENTAL_SINCE", "").strip(),
+        help=(
+            "哈佛源侧增量水位 lastupdate；为空则自动使用 CSV 中 source_updated_at 最大值；"
+            "可在 .env 配 HAM_INCREMENTAL_SINCE"
+        ),
+    )
+    ap.add_argument(
+        "--no-ham-source-incremental",
+        action="store_true",
+        help="关闭哈佛 lastupdate 源侧增量，退回仅本地快照比对",
     )
     ap.add_argument(
         "--ham-repair-multi-images",
@@ -201,6 +235,11 @@ def main() -> None:
         action="store_true",
         help="只爬取与入库，不导出三元组与实体 CSV",
     )
+    ap.add_argument(
+        "--auto-sync-neo4j",
+        action="store_true",
+        help="存在新增/更新时自动导出 KG 并同步 Neo4j（需要 NEO4J_*）",
+    )
     args = ap.parse_args()
 
     out_dir: Path = args.output
@@ -239,7 +278,7 @@ def main() -> None:
 
     si_key = os.environ.get("SI_DATA_GOV_API_KEY", "").strip()
     hv_key = os.environ.get("HARVARD_ART_MUSEUMS_API_KEY", "").strip()
-    stats: dict[str, tuple[int, int]] = {}
+    stats: dict[str, dict[str, int]] = {}
 
     if "smithsonian" in selected:
         print("\n" + "─" * 50)
@@ -277,7 +316,7 @@ def main() -> None:
         if not hv_key:
             log.warning("跳过：未设置 HARVARD_ART_MUSEUMS_API_KEY")
         elif args.ham_repair_multi_images:
-            stats["Harvard"] = repair_harvard_multi_images(
+            repaired = repair_harvard_multi_images(
                 hv_key,
                 out_dir / "harvard_art_museums.csv",
                 img_root,
@@ -286,6 +325,17 @@ def main() -> None:
                 strict_multi=not args.ham_relaxed_multi,
                 force_all=args.ham_repair_multi_force,
             )
+            stats["Harvard"] = {
+                "records": repaired[0],
+                "images_downloaded": repaired[1],
+                "new": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "skipped": 0,
+                "scanned": repaired[0],
+                "changes": 0,
+            }
             quality_check(out_dir / "harvard_art_museums.csv")
         else:
             stats["Harvard"] = crawl_harvard(
@@ -298,6 +348,8 @@ def main() -> None:
                 db_writer=db_writer,
                 allow_no_image=args.ham_allow_no_image,
                 strict_multi=not args.ham_relaxed_multi,
+                source_incremental=not args.no_ham_source_incremental,
+                incremental_since=args.ham_incremental_since,
             )
             quality_check(out_dir / "harvard_art_museums.csv")
 
@@ -306,22 +358,44 @@ def main() -> None:
         print("  ③ Museum of Fine Arts, Boston")
         print("─" * 50)
         if args.mfa_repair_images:
-            stats["MFA_Boston"] = repair_mfa_images(
+            repaired = repair_mfa_images(
                 out_dir / "museum_of_fine_arts_boston.csv",
                 img_root,
                 max(args.delay, 0.3),
                 browser_headless=args.mfa_headless and not args.mfa_show_browser,
                 limit=args.limit,
             )
+            stats["MFA_Boston"] = {
+                "records": repaired[0],
+                "images_downloaded": repaired[1],
+                "new": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "skipped": 0,
+                "scanned": repaired[0],
+                "changes": 0,
+            }
             quality_check(out_dir / "museum_of_fine_arts_boston.csv")
         elif args.mfa_repair_metadata:
-            stats["MFA_Boston"] = repair_mfa_metadata(
+            repaired = repair_mfa_metadata(
                 out_dir / "museum_of_fine_arts_boston.csv",
                 max(args.delay, 0.3),
                 browser_headless=args.mfa_headless and not args.mfa_show_browser,
                 limit=args.limit,
                 db_writer=db_writer,
             )
+            stats["MFA_Boston"] = {
+                "records": repaired[0],
+                "images_downloaded": repaired[1],
+                "new": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "skipped": 0,
+                "scanned": repaired[0],
+                "changes": 0,
+            }
             quality_check(out_dir / "museum_of_fine_arts_boston.csv")
         else:
             stats["MFA_Boston"] = crawl_mfa(
@@ -363,12 +437,25 @@ def main() -> None:
 
     _print_summary(stats)
 
+    changed_total = sum(
+        int(st.get("new", 0)) + int(st.get("updated", 0))
+        for st in stats.values()
+    )
+    if args.auto_sync_neo4j and changed_total > 0 and not args.no_kg_export and kg_stats is not None:
+        if neo4j_configured():
+            try:
+                neo4j_stats = sync_kg_to_neo4j(out_dir / "kg")
+                log.info("[Neo4j] 自动同步完成: %s", neo4j_stats)
+            except Exception as exc:
+                log.error("[Neo4j] 自动同步失败: %s", exc)
+        else:
+            log.info("[Neo4j] 已有变更，但未配置 NEO4J_*，跳过自动同步")
+    elif args.auto_sync_neo4j and args.no_kg_export:
+        log.info("[Neo4j] --no-kg-export 已启用，自动同步被跳过")
+
     summary = {
         "crawl_date": date.today().isoformat(),
-        "museums": {
-            k: {"records": v[0], "images_downloaded": v[1]}
-            for k, v in stats.items()
-        },
+        "museums": stats,
     }
     with open(out_dir / "crawl_summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)

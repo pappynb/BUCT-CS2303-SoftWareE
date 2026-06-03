@@ -12,7 +12,7 @@ import csv
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urljoin, urlparse
@@ -21,6 +21,12 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 from museum_crawler.config import MUSEUM_ID_MFA_BOSTON
+from museum_crawler.incremental import (
+    IncrementalCsvStore,
+    append_change_log,
+    diff_fields,
+    save_state,
+)
 from museum_crawler.record_build import finalize_record
 from museum_crawler.http_client import (
     UA_POOL,
@@ -1123,15 +1129,17 @@ def _crawl_mfa_details_on_page(
     limit: int,
     delay: float,
     crawl_day: str,
-    seen_ids: set[str],
-    seen_urls: set[str],
     db_writer: Optional["MySQLWriter"],
-) -> tuple[int, int]:
+    store: IncrementalCsvStore | None = None,
+) -> dict[str, int]:
     img_ok = 0
     rows_batch: list[dict[str, Any]] = []
     total_written = 0
     flush_every = 5
     n_detail_fail = n_dl_fail = n_ok = 0
+    total_new = total_updated = total_unchanged = 0
+    total_scanned = 0
+    change_rows: list[dict[str, Any]] = []
     img_sess = make_session()
     _sync_playwright_cookies_to_session(context, img_sess)
     # 预先创建 CSV 表头，便于用户在运行中看到文件出现
@@ -1145,8 +1153,6 @@ def _crawl_mfa_details_on_page(
             if limit and already >= limit:
                 break
             norm_url = _mfa_normalize_detail_url(url)
-            if norm_url in seen_urls:
-                continue
             detail_html = ""
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=90_000)
@@ -1161,13 +1167,18 @@ def _crawl_mfa_details_on_page(
                 n_detail_fail += 1
                 continue
             oid = rec.get("object_id", "").strip()
-            if oid in seen_ids:
+            total_scanned += 1
+            old = store.get(oid) if store else None
+            if old and not diff_fields(old, rec):
+                total_unchanged += 1
                 continue
             rec["crawl_date"] = crawl_day
             ext = ext_from_url(rec["image_url"])
             dest = _mfa_image_dest(img_root, oid, ext)
             rec["image_path"] = ""
             _sync_playwright_cookies_to_session(context, img_sess)
+            if old:
+                _mfa_remove_object_image_files(img_root, oid)
             jitter(delay * 0.3, 0.1, 0.4)
             if _mfa_download_record_image(
                 image_url=rec["image_url"],
@@ -1191,29 +1202,89 @@ def _crawl_mfa_details_on_page(
                         dest,
                     )
                 continue
-            seen_ids.add(oid)
-            seen_urls.add(norm_url)
+            if store:
+                change_type, changed_fields = store.upsert(rec)
+                if change_type == "new":
+                    total_new += 1
+                elif change_type == "updated":
+                    total_updated += 1
+                elif change_type == "unchanged":
+                    total_unchanged += 1
+                    continue
+                change_rows.append(
+                    {
+                        "object_id": oid,
+                        "change_type": change_type,
+                        "changed_fields": changed_fields,
+                        "title": rec.get("title", ""),
+                        "detail_url": rec.get("detail_url", ""),
+                    }
+                )
             rows_batch.append(rec)
             pbar.set_postfix_str(
                 f"写入{total_written + len(rows_batch)} 图{img_ok}",
                 refresh=True,
             )
             if len(rows_batch) >= flush_every:
-                append_csv(out_csv, rows_batch, db_writer)
-                total_written += len(rows_batch)
+                if store:
+                    if db_writer:
+                        db_writer.upsert_batch(rows_batch)
+                else:
+                    append_csv(out_csv, rows_batch, db_writer)
+                    total_written += len(rows_batch)
                 rows_batch = []
     finally:
         pbar.close()
 
     if rows_batch:
-        append_csv(out_csv, rows_batch, db_writer)
-        total_written += len(rows_batch)
+        if store:
+            if db_writer:
+                db_writer.upsert_batch(rows_batch)
+        else:
+            append_csv(out_csv, rows_batch, db_writer)
+            total_written += len(rows_batch)
 
     log.info(
         "[MFA] 小结 | 详情解析失败 %d | 图片下载失败 %d | 成功写入 %d | 累计已写入 %d",
         n_detail_fail, n_dl_fail, n_ok, total_written,
     )
-    return total_written, img_ok
+    if store:
+        store.save()
+        total_written = total_new + total_updated
+        summary = {
+            "records": total_written,
+            "images_downloaded": img_ok,
+            "new": total_new,
+            "updated": total_updated,
+            "unchanged": total_unchanged,
+            "failed": n_dl_fail + n_detail_fail,
+            "scanned": total_scanned,
+            "changes": len(change_rows),
+        }
+        append_change_log(
+            out_csv.parent / "crawl_changes.jsonl",
+            run_at=datetime.now().isoformat(timespec="seconds"),
+            museum="MFA_Boston",
+            csv_name=out_csv.name,
+            changes=change_rows,
+            summary=summary,
+        )
+        save_state(
+            out_csv.parent / ".crawl_state",
+            "mfa_boston",
+            store,
+            summary=summary,
+        )
+    return {
+        "records": total_written,
+        "images_downloaded": img_ok,
+        "new": total_new,
+        "updated": total_updated,
+        "unchanged": total_unchanged,
+        "failed": n_dl_fail + n_detail_fail,
+        "scanned": total_scanned,
+        "changes": len(change_rows),
+    }
 
 
 def _mfa_image_file_ok(csv_parent: Path, image_path: str, *, min_bytes: int = 2048) -> bool:
@@ -1637,16 +1708,11 @@ def crawl_mfa(
     use_browser: bool = True,
     browser_headless: bool = False,
     max_pages_per_list: int = 0,
-) -> tuple[int, int]:
+) -> dict[str, int]:
     crawl_day = date.today().isoformat()
-    seen_ids, seen_urls = _mfa_load_seen_keys(out_csv)
-    if seen_ids or seen_urls:
-        log.info(
-            "[MFA] 断点：已有本地图片 %d 条（ID %d / URL %d；可用 --mfa-repair-metadata 补字段）",
-            len(seen_urls),
-            len(seen_ids),
-            len(seen_urls),
-        )
+    store = IncrementalCsvStore.load(out_csv)
+    if store.rows:
+        log.info("[MFA] 本地快照：%d 条", len(store.rows))
 
     links: list[str] = []
     pw = browser = context = page = None
@@ -1678,7 +1744,15 @@ def crawl_mfa(
             log.error("[MFA] Playwright 失败: %s", exc)
             if pw and browser:
                 _mfa_close_browser(pw, browser)
-            return 0, 0
+            return {
+                "records": 0,
+                "images_downloaded": 0,
+                "new": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "failed": 1,
+                "changes": 0,
+            }
     elif not use_browser:
         sess = make_session()
         log.info("[MFA] 使用 requests 收集链接…")
@@ -1694,7 +1768,15 @@ def crawl_mfa(
             "pip install playwright && playwright install chromium；"
             "并保持浏览器窗口直至出现藏品列表（勿用 --mfa-headless）"
         )
-        return 0, 0
+        return {
+            "records": 0,
+            "images_downloaded": 0,
+            "new": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "failed": 1,
+            "changes": 0,
+        }
 
     if use_browser and page is not None and context is not None:
         log.info(
@@ -1703,7 +1785,7 @@ def crawl_mfa(
             limit if limit else "不限",
         )
         try:
-            total_written, img_ok = _crawl_mfa_details_on_page(
+            result = _crawl_mfa_details_on_page(
                 page,
                 context,
                 links,
@@ -1712,24 +1794,26 @@ def crawl_mfa(
                 limit,
                 delay,
                 crawl_day,
-                seen_ids,
-                seen_urls,
                 db_writer,
+                store=store,
             )
         finally:
             if pw and browser:
                 _mfa_close_browser(pw, browser)
         log.info(
             "[MFA] 完成：写入 %d 条，图片 %d 张 → %s",
-            total_written, img_ok, out_csv,
+            result.get("records", 0), result.get("images_downloaded", 0), out_csv,
         )
-        return total_written, img_ok
+        return result
 
     # requests 详情模式（仅当 --mfa-no-browser 且链接非空时）
     sess = make_session()
-    img_ok = 0
     rows_batch: list[dict[str, Any]] = []
     total_written = 0
+    total_new = 0
+    total_updated = 0
+    total_unchanged = 0
+    change_rows: list[dict[str, Any]] = []
     pbar = tqdm(links, desc="MFA Boston", unit="条", dynamic_ncols=True)
     try:
         n_detail_fail = n_dl_fail = n_ok = 0
@@ -1737,9 +1821,6 @@ def crawl_mfa(
             already = total_written + len(rows_batch)
             if limit and already >= limit:
                 break
-            norm_url = _mfa_normalize_detail_url(url)
-            if norm_url in seen_urls:
-                continue
             try:
                 r = retry_get(sess, url, timeout=60, retries=3)
             except Exception:
@@ -1757,12 +1838,16 @@ def crawl_mfa(
                 jitter(delay, 0.1, 0.3)
                 continue
             oid = rec.get("object_id", "").strip()
-            if oid in seen_ids:
+            old = store.get(oid)
+            if old and not diff_fields(old, rec):
+                total_unchanged += 1
                 continue
             rec["crawl_date"] = crawl_day
             ext = ext_from_url(rec["image_url"])
             dest = _mfa_image_dest(img_root, oid, ext)
             rec["image_path"] = ""
+            if old:
+                _mfa_remove_object_image_files(img_root, oid)
             jitter(delay * 0.3, 0.1, 0.4)
             if _mfa_download_record_image(
                 image_url=rec["image_url"],
@@ -1771,7 +1856,6 @@ def crawl_mfa(
                 dest=dest,
                 img_sess=sess,
             ):
-                img_ok += 1
                 n_ok += 1
                 rec["image_path"] = _mfa_image_rel_path(oid, ext)
             else:
@@ -1784,20 +1868,35 @@ def crawl_mfa(
                         dest,
                     )
                 continue
-            seen_ids.add(oid)
-            seen_urls.add(norm_url)
+            change_type, changed_fields = store.upsert(rec)
+            if change_type == "new":
+                total_new += 1
+            elif change_type == "updated":
+                total_updated += 1
+            elif change_type == "unchanged":
+                total_unchanged += 1
+                continue
+            change_rows.append(
+                {
+                    "object_id": oid,
+                    "change_type": change_type,
+                    "changed_fields": changed_fields,
+                    "title": rec.get("title", ""),
+                    "detail_url": rec.get("detail_url", ""),
+                }
+            )
             rows_batch.append(rec)
             pbar.set_postfix_str(
-                f"写入{total_written + len(rows_batch)} 图{img_ok}",
+                f"写入{total_new + total_updated + len(rows_batch)}",
                 refresh=True,
             )
             if len(rows_batch) >= 10:
-                append_csv(out_csv, rows_batch, db_writer)
-                total_written += len(rows_batch)
+                if db_writer:
+                    db_writer.upsert_batch(rows_batch)
                 rows_batch = []
         if rows_batch:
-            append_csv(out_csv, rows_batch, db_writer)
-            total_written += len(rows_batch)
+            if db_writer:
+                db_writer.upsert_batch(rows_batch)
         log.info(
             "[MFA] 小结 | 详情解析失败 %d | 图片下载失败 %d | 成功写入 %d",
             n_detail_fail, n_dl_fail, total_written,
@@ -1805,5 +1904,41 @@ def crawl_mfa(
     finally:
         pbar.close()
 
-    log.info("[MFA] 完成：写入 %d 条，图片 %d 张 → %s", total_written, img_ok, out_csv)
-    return total_written, img_ok
+    store.save()
+    total_written = total_new + total_updated
+    summary = {
+        "records": total_written,
+        "images_downloaded": n_ok,
+        "new": total_new,
+        "updated": total_updated,
+        "unchanged": total_unchanged,
+        "failed": n_dl_fail + n_detail_fail,
+        "changes": len(change_rows),
+    }
+    append_change_log(
+        out_csv.parent / "crawl_changes.jsonl",
+        run_at=datetime.now().isoformat(timespec="seconds"),
+        museum="MFA_Boston",
+        csv_name=out_csv.name,
+        changes=change_rows,
+        summary=summary,
+    )
+    save_state(
+        out_csv.parent / ".crawl_state",
+        "mfa_boston",
+        store,
+        summary=summary,
+    )
+    log.info(
+        "[MFA] 完成：写入 %d 条（新 %d / 更 %d / 未变 %d）→ %s",
+        total_written, total_new, total_updated, total_unchanged, out_csv,
+    )
+    return {
+        "records": total_written,
+        "images_downloaded": n_ok,
+        "new": total_new,
+        "updated": total_updated,
+        "unchanged": total_unchanged,
+        "failed": n_dl_fail + n_detail_fail,
+        "changes": len(change_rows),
+    }

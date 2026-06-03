@@ -82,6 +82,7 @@ ARTIFACT_COL_DDL: dict[str, str] = {
     "image_count": "SMALLINT NOT NULL DEFAULT 0",
     "credit_line": "VARCHAR(500)",
     "accession_number": "VARCHAR(200)",
+    "source_updated_at": "VARCHAR(64) NOT NULL DEFAULT ''",
     "crawl_date": "DATE NOT NULL",
 }
 if set(ARTIFACT_COL_DDL) != set(CSV_FIELDS):

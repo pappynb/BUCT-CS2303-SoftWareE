@@ -285,6 +285,7 @@ def export_knowledge_graph(
                     ("imageCount", "image_count"),
                     ("creditLine", "credit_line"),
                     ("accessionNumber", "accession_number"),
+                    ("sourceUpdatedAt", "source_updated_at"),
                     ("crawlDate", "crawl_date"),
                     ("artistProvince", "artist_province"),
                     ("artistWikidataId", "artist_wikidata_id"),
