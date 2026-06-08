@@ -177,6 +177,7 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+# 输出crawl_runs.jsonl
 def append_run_log(
     path: Path,
     *,
@@ -194,7 +195,6 @@ def append_run_log(
             "kg": kg or {},
         },
     )
-
 
 def append_change_log(
     path: Path,

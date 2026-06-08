@@ -441,6 +441,7 @@ def main() -> None:
         int(st.get("new", 0)) + int(st.get("updated", 0))
         for st in stats.values()
     )
+    # 图数据库的同步
     if args.auto_sync_neo4j and changed_total > 0 and not args.no_kg_export and kg_stats is not None:
         if neo4j_configured():
             try:

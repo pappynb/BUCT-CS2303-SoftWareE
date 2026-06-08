@@ -642,6 +642,7 @@ def crawl_harvard(
             n_dup = n_noimg = n_dl_fail = n_partial = 0
             n_ok_page = 0
             for rec in records:
+                # 遍历数据
                 total_scanned += 1
                 already = total_scanned
                 if limit and already >= limit:
@@ -664,7 +665,10 @@ def crawl_harvard(
                         source_updated_at,
                         source_watermark,
                     )
+                    # 更新时间小于给定的水位线
+                    # 由于排序过了 直接停止继续遍历
                     break
+                # 解析得到的记录拿到预览
                 preview = _ham_preview_record(rec)
                 old = store.get(oid) if store else None
                 if store and old:
@@ -769,6 +773,7 @@ def crawl_harvard(
                 break
             jitter(delay, 0.5, 1.5)
     finally:
+        # 记录每次爬取的时间、数量与变更详情
         pbar.close()
         if store:
             if rows_batch and db_writer:
@@ -787,6 +792,7 @@ def crawl_harvard(
                 "changes": len(change_rows),
                 "source_incremental_since": source_watermark,
             }
+            # 记录时间
             append_change_log(
                 out_csv.parent / "crawl_changes.jsonl",
                 run_at=datetime.now().isoformat(timespec="seconds"),
